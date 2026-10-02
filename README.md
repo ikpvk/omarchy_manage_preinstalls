@@ -168,3 +168,13 @@ Item id format: `webapp|<Name>` / `tui|<Name>` / `cli|<bin>` / `pkg|<pkg>`
   packaged `.desktop` files, then system restored.
 - "Nothing to do" no-op path when the selection matches installed state.
 - Menu JSONC validated (trailing comma is fine — JSONC).
+## 9. Tests
+
+`tests/run.sh` runs the script in a throwaway sandbox (fake `$HOME`, mock
+Omarchy helpers that only log their calls), so it never touches the real
+system and also runs without Omarchy installed. CI runs it plus ShellCheck on
+every push.
+
+```bash
+tests/run.sh
+```

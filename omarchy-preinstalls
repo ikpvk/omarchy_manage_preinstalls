@@ -192,7 +192,7 @@ add_item() {
   ID_INSTALLED["$id"]="$installed"
 }
 
-name= url= icon= exec= mime= pkg= bin= cmd= style=
+name='' url='' icon='' exec='' mime='' pkg='' bin='' cmd='' style=''
 while IFS=$'\t' read -r name url icon exec mime; do
   [[ -n $name ]] || continue
   add_item "webapp|$name" "Web App · $name" "$(webapp_installed "$name" && echo 1 || echo 0)"
