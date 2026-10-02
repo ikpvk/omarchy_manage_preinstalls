@@ -109,8 +109,39 @@ tui_installed() {
   [[ -f $file ]] && grep -qE '^Exec=.*xdg-terminal-exec --app-id=TUI\.' "$file"
 }
 
-cli_installed() {
-  [[ -x "$BIN_DIR/$1" ]]
+# An Omarchy CLI stub is the wrapper omarchy-mise-install writes: a regular
+# file (not a symlink) with a `mise use -g ... "<package>"` line. Anything else
+# at the path is the user's own and must be neither removed nor overwritten.
+is_mise_stub() {
+  local file="$1" pkg="$2"
+  [[ -f $file && ! -L $file ]] || return 1
+  awk -v want="\"$pkg\"" '
+    index($0, "mise use -g ") == 1 && index($0, want) { found = 1 }
+    END { exit !found }
+  ' "$file"
+}
+
+# playwright-cli was written by the old omarchy-npx-install, never by mise. Its
+# three historical forms, for package playwright or playwright-cli:
+#   exec npx --yes <pkg> "$@"
+#   exec mise exec node@latest -- npx --yes <pkg> "$@"
+#   package="<pkg>"
+is_legacy_playwright_cli() {
+  local file="$1"
+  [[ -f $file && ! -L $file ]] || return 1
+  grep -qE '^(exec (mise exec node@latest -- )?npx --yes (playwright|playwright-cli) "\$@"|package="(playwright|playwright-cli)")$' "$file"
+}
+
+# Prints absent, stub, or conflict (something unmanaged is in the way).
+cli_state() {
+  local file="$BIN_DIR/$1" pkg="$2"
+  if [[ ! -e $file && ! -L $file ]]; then
+    echo absent
+  elif is_mise_stub "$file" "$pkg"; then
+    echo stub
+  else
+    echo conflict
+  fi
 }
 
 pkg_installed() {
@@ -146,6 +177,12 @@ install_id() {
   cli\|*)
     bin=${id#cli|}
     IFS=$'\t' read -r bin pkg cmd <<<"$(cli_items | awk -F '\t' -v n="$bin" '$1==n')"
+    # Re-check right before acting: something may have appeared at the path
+    # since the picker, and omarchy-mise-install deletes whatever is there.
+    if [[ $(cli_state "$bin" "$pkg") != absent ]]; then
+      echo "  Skipped CLI Tool · $bin: $BIN_DIR/$bin appeared since the check; left untouched."
+      return 0
+    fi
     mapfile -t args < <(printf '%s\n' "$pkg")
     if [[ -n ${cmd:-} ]]; then args+=("$cmd"); fi
     run omarchy-mise-install "${args[@]}"
@@ -157,7 +194,7 @@ install_id() {
 }
 
 remove_id() {
-  local id="$1" name
+  local id="$1" name pkg
   case "$id" in
   webapp\|*)
     name=${id#webapp|}
@@ -169,9 +206,22 @@ remove_id() {
     ;;
   cli\|*)
     name=${id#cli|}
+    IFS=$'\t' read -r name pkg _ <<<"$(cli_items | awk -F '\t' -v n="$name" '$1==n')"
+    # Re-check right before acting: the stub may have been replaced since the
+    # picker.
+    if [[ $(cli_state "$name" "$pkg") != stub ]]; then
+      echo "  Skipped CLI Tool · $name: $BIN_DIR/$name is no longer an Omarchy stub; left untouched."
+      return 0
+    fi
     run rm -f "$BIN_DIR/$name"
-    if [[ $name == playwright ]]; then
-      run rm -f "$BIN_DIR/playwright-cli"
+    MISE_LEFTOVERS+=("$pkg")
+    # Legacy companion stub; checked on its own, since the user may own it.
+    if [[ $name == playwright && ( -e $BIN_DIR/playwright-cli || -L $BIN_DIR/playwright-cli ) ]]; then
+      if is_legacy_playwright_cli "$BIN_DIR/playwright-cli"; then
+        run rm -f "$BIN_DIR/playwright-cli"
+      else
+        echo "  Left $BIN_DIR/playwright-cli in place (not an Omarchy stub)."
+      fi
     fi
     ;;
   pkg\|*)
@@ -184,6 +234,10 @@ remove_id() {
 
 declare -a IDS=()
 declare -A ID_LABEL ID_INSTALLED
+# Items whose path holds something Omarchy didn't write: id -> path.
+declare -A ID_CONFLICT=()
+# mise packages whose CLI stub was removed (the tool itself stays installed).
+declare -a MISE_LEFTOVERS=()
 
 add_item() {
   local id="$1" label="$2" installed="$3"
@@ -205,7 +259,14 @@ done < <(tui_items)
 
 while IFS=$'\t' read -r bin pkg cmd; do
   [[ -n $bin ]] || continue
-  add_item "cli|$bin" "CLI Tool · $bin" "$(cli_installed "$bin" && echo 1 || echo 0)"
+  case "$(cli_state "$bin" "$pkg")" in
+  stub) add_item "cli|$bin" "CLI Tool · $bin" 1 ;;
+  absent) add_item "cli|$bin" "CLI Tool · $bin" 0 ;;
+  conflict)
+    add_item "cli|$bin" "CLI Tool · $bin" 0
+    ID_CONFLICT["cli|$bin"]="$BIN_DIR/$bin"
+    ;;
+  esac
 done < <(cli_items)
 
 while IFS=$'\t' read -r pkg; do
@@ -216,6 +277,7 @@ done < <(pkg_items)
 opts=()
 selected_labels=()
 for id in "${IDS[@]}"; do
+  if [[ -n ${ID_CONFLICT[$id]:-} ]]; then continue; fi
   opts+=("${ID_LABEL[$id]}:$id")
   if [[ ${ID_INSTALLED[$id]} == 1 ]]; then
     selected_labels+=("${ID_LABEL[$id]}")
@@ -254,6 +316,7 @@ done <<<"$selection"
 install_list=()
 remove_list=()
 for id in "${IDS[@]}"; do
+  if [[ -n ${ID_CONFLICT[$id]:-} ]]; then continue; fi
   if [[ ${SELECTED[$id]:-0} == 1 ]]; then
     [[ ${ID_INSTALLED[$id]} == 0 ]] && install_list+=("$id")
   else
@@ -270,6 +333,14 @@ if (( ${#remove_list[@]} > 0 )); then
   echo "Will remove:"
   for id in "${remove_list[@]}"; do printf '  - %s\n' "${ID_LABEL[$id]}"; done
 fi
+if (( ${#ID_CONFLICT[@]} > 0 )); then
+  echo "Left untouched (not installed by Omarchy):"
+  for id in "${IDS[@]}"; do
+    if [[ -n ${ID_CONFLICT[$id]:-} ]]; then
+      printf '  = %s (%s)\n' "${ID_LABEL[$id]}" "${ID_CONFLICT[$id]}"
+    fi
+  done
+fi
 if (( ${#install_list[@]} == 0 && ${#remove_list[@]} == 0 )); then
   echo "Nothing to do."
   exit 0
@@ -282,6 +353,12 @@ apply() {
   for id in "${install_list[@]}"; do
     install_id "$id"
   done
+  if (( ${#MISE_LEFTOVERS[@]} > 0 )); then
+    echo
+    echo "Removed the CLI wrappers only; mise still has the tools installed."
+    echo "To remove one completely, run:"
+    printf '  mise unuse -g %q\n' "${MISE_LEFTOVERS[@]}"
+  fi
 }
 
 if [[ $DRY_RUN == 1 ]]; then

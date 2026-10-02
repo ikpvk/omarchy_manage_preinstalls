@@ -6,7 +6,7 @@ Mark items `[x]` when fixed and add a short note on what changed.
 
 ## Order of work
 
-1. Ownership / conflicts (#1), selection validation (#2), dry-run and argument validation (#4, #5), prerequisite and detection checks (#11).
+1. Ownership / conflicts (#1, #13), selection validation (#2), dry-run and argument validation (#4, #5), prerequisite and detection checks (#11).
 2. Package batching (#8), dependencies (#6), failure reporting (#3).
 3. Remaining items (#7, #9, #10, #12), documentation and cleanup (Minor).
 
@@ -14,12 +14,13 @@ Mark items `[x]` when fixed and add a short note on what changed.
 
 ## Will break / cause damage
 
-- [ ] **1. CLI stubs: no ownership check, for both removal and installation** (`omarchy-preinstalls:113`, `:172`, `:146-152`)
+- [x] **1. CLI stubs: no ownership check, for both removal and installation** (`omarchy-preinstalls:113`, `:172`, `:146-152`)
   - Problem (removal): any executable at `~/.local/bin/<bin>` counts as "installed"; unchecking runs `rm -f` on it. Real installs and user scripts/symlinks live there too (e.g. Claude Code's native installer puts `claude` at `~/.local/bin/claude`).
   - Problem (installation): `omarchy-mise-install` runs `rm -f ~/.local/bin/<cmd>` before writing its wrapper, so just marking a non-stub file "not installed" is not enough — checking it would overwrite the user's binary.
   - Fix: three states per CLI item — stub (managed), absent, conflict (unmanaged file present). Note that stock `omarchy-remove-preinstalls` still blindly `rm -f`s the original CLI list and only fingerprints the newer tools (`cursor-agent`, `muse`, `hermes`); extend that fingerprint pattern to **every** CLI item: regular file (not a symlink) containing a line matching `^mise use -g .*"<pkg>"`. Block both install and removal for conflicts and show them as such in the picker/summary.
   - Check `playwright-cli` independently before deleting it (stock remove script deletes it, but nothing in current Omarchy creates it — likely a legacy name).
   - Note: removing the stub leaves the downloaded mise tool on disk **and** a global mise config entry (the stub runs `mise use -g` on first run). Don't run `mise uninstall` / `mise unuse -g` automatically (the tool may be used elsewhere); document the leftover, or make full uninstall opt-in.
+  - **Done:** `cli_state` classifies each CLI path as absent / stub / conflict via `is_mise_stub` (regular file, not a symlink, `mise use -g` line naming the package). Conflicts are hidden from the picker, skipped in the diff, and listed under "Left untouched" — never removed or installed over. `playwright-cli` is only deleted if it matches one of the three formats the old `omarchy-npx-install` wrote (traced in upstream Omarchy history) for package `playwright` or `playwright-cli`. Ownership is re-checked immediately before each CLI install/remove, so a file that appears or is replaced while the confirm prompt is open is skipped (only the unavoidable ms gap before the helper's own `rm -f` remains). After removing stubs the script prints `mise unuse -g <pkg>` for full removal (documented in README). Tests: 11 new cases in `tests/run.sh` (incl. files changed while the confirm prompt is open, all legacy `playwright-cli` formats, and an unrelated mise stub at that path).
 
 - [ ] **2. Scripted selection: unsafe input handling** (`:226`, `:246`)
   - Keep the current meaning: `OMARCHY_PREINSTALLS_SELECTION` is the complete desired state (don't make it add-only — that would change the interface).
@@ -69,6 +70,10 @@ Mark items `[x]` when fixed and add a short note on what changed.
 - [ ] **12. Inventory is already out of date with current Omarchy**
   - Problem: stock `omarchy-remove-preinstalls` also manages `cursor-agent`, `muse`, and `hermes` (all present in `~/.local/bin` on this machine); this script doesn't list them. They also need special ownership checks: `cursor-agent` and `muse` use specific `mise use -g` fingerprints (Cursor's own installer can symlink `cursor-agent`), and `hermes` uses `omarchy-install-hermes-cli --owns`.
   - Fix: add them with the stock ownership checks, and add a check that compares the built-in lists against `$OMARCHY_PATH` (`applications/*.desktop`, `install/user/mise.sh`, `install/omarchy-base.packages`, `bin/omarchy-remove-preinstalls`) and warns when they differ.
+
+- [ ] **13. Web app / TUI installs can overwrite a user's own `.desktop` file** (found while fixing #1)
+  - Problem: `omarchy-webapp-install` and `omarchy-tui-install` write `~/.local/share/applications/<Name>.desktop` unconditionally (`cat >"$DESKTOP_FILE"`). A file there whose `Exec=` isn't an Omarchy launcher reads as "not installed", so checking the item replaces the user's file.
+  - Fix: same three-state model as #1 — absent / Omarchy launcher / conflict — and hide, skip, and report conflicts.
 
 ## Minor
 

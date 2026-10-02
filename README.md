@@ -24,7 +24,7 @@ set spans **four categories**:
 |---|---|---|
 | Web app launchers | 11 | `.desktop` file with `Exec=omarchy-launch-webapp*` / `omarchy-webapp-handler*` |
 | TUI launchers | 2 | `.desktop` file with `Exec=*xdg-terminal-exec --app-id=TUI.*` |
-| CLI tool stubs | 13 | executable in `~/.local/bin/` |
+| CLI tool stubs | 13 | regular file in `~/.local/bin/` with a `mise use -g … "<pkg>"` line (anything else there is the user's and is left alone) |
 | Desktop packages | 13 | installed via `pacman` |
 
 ### Backend commands that already exist (reused, nothing reinvented)
@@ -33,7 +33,7 @@ set spans **four categories**:
 |---|---|---|
 | Web app | `omarchy-webapp-install <name> <url> <icon> [exec] [mime]` | `omarchy-webapp-remove <name>` |
 | TUI | `omarchy-tui-install <name> <cmd> <float\|tile> <icon>` | `omarchy-tui-remove <name>` |
-| CLI stub | `omarchy-mise-install <pkg> [command]` | `rm ~/.local/bin/<bin>` |
+| CLI stub | `omarchy-mise-install <pkg> [command]` | `rm ~/.local/bin/<bin>` (stubs only; the mise tool stays installed — `mise unuse -g <pkg>` removes it) |
 | Package | `omarchy-pkg-add <pkg>` | `omarchy-pkg-drop <pkg>` |
 
 ## 3. The Solution
@@ -44,7 +44,10 @@ Omarchy already uses:
 1. Builds the full inventory (hardcoded tables mirroring
    `$OMARCHY_PATH/applications/*.desktop`, `install/user/mise.sh`, and
    `install/omarchy-base.packages`).
-2. Detects what is currently installed per item.
+2. Detects what is currently installed per item. A CLI path holding something
+   Omarchy didn't write (a real install, a symlink, a user script) is a
+   conflict: it is hidden from the picker, never removed or overwritten, and
+   listed as "Left untouched" in the summary.
 3. Renders a `gum choose --no-limit` checkbox list, **pre-checking installed
    items** (grouped and labeled as `Web App · X`, `TUI · X`, `CLI Tool · X`,
    `Package · X`; `space`/`x` toggles, `enter` confirms, `ctrl+a` toggles all).

@@ -61,7 +61,12 @@ gum)
     [[ -f $MOCK_STATE/choose_reply ]] && cat "$MOCK_STATE/choose_reply"
     exit "${MOCK_GUM_CHOOSE_RC:-0}"
     ;;
-  confirm) exit "${MOCK_GUM_CONFIRM_RC:-0}" ;;
+  confirm)
+    # Lets a test change files while the prompt is "open".
+    # shellcheck disable=SC1091
+    [[ -f $MOCK_STATE/on_confirm ]] && source "$MOCK_STATE/on_confirm"
+    exit "${MOCK_GUM_CONFIRM_RC:-0}"
+    ;;
   esac
   ;;
 omarchy-pkg-present)
@@ -123,7 +128,26 @@ run_script() {
 # Fake installed state.
 have_webapp() { printf '[Desktop Entry]\nExec=omarchy-launch-webapp https://example.com\n' >"$HOME_DIR/.local/share/applications/$1.desktop"; }
 have_tui() { printf '[Desktop Entry]\nExec=xdg-terminal-exec --app-id=TUI.%s -e true\n' "$1" >"$HOME_DIR/.local/share/applications/$1.desktop"; }
-have_stub() { printf '#!/bin/bash\n' >"$HOME_DIR/.local/bin/$1"; chmod +x "$HOME_DIR/.local/bin/$1"; }
+# have_stub <bin> [mise-package]: the wrapper omarchy-mise-install writes.
+have_stub() {
+  local bin="$1" pkg="${2:-$1}"
+  printf '#!/bin/bash\nexport MISE_MINIMUM_RELEASE_AGE=0\nmise use -g --quiet "%s" || exit 1\nexec mise x "%s" -- "%s" "$@"\n' \
+    "$pkg" "$pkg" "$bin" >"$HOME_DIR/.local/bin/$bin"
+  chmod +x "$HOME_DIR/.local/bin/$bin"
+}
+# have_legacy_playwright_cli <1|2|3> [package]: the old omarchy-npx-install
+# wrapper formats, oldest first.
+have_legacy_playwright_cli() {
+  local pkg="${2:-playwright}" file="$HOME_DIR/.local/bin/playwright-cli"
+  case $1 in
+  1) printf '#!/bin/bash\nexec npx --yes %s "$@"\n' "$pkg" >"$file" ;;
+  2) printf '#!/bin/bash\nexec mise exec node@latest -- npx --yes %s "$@"\n' "$pkg" >"$file" ;;
+  3) printf '#!/bin/bash\npackage="%s"\ncommand="playwright-cli"\n' "$pkg" >"$file" ;;
+  esac
+  chmod +x "$file"
+}
+# A file at a stub path that Omarchy didn't write (e.g. a real install).
+have_user_bin() { printf '#!/bin/bash\necho users own %s\n' "$1" >"$HOME_DIR/.local/bin/$1"; chmod +x "$HOME_DIR/.local/bin/$1"; }
 have_pkg() { printf '%s\n' "$1" >>"$STATE/pkgs"; }
 
 # Every item id, read from the options the script hands to the picker
@@ -144,6 +168,7 @@ assert_rc() { [[ $RC == "$1" ]] || fail "exit code $RC, expected $1"; }
 assert_out_has() { grep -qF -- "$1" "$OUT" || fail "output lacks: $1"; }
 assert_called() { grep -qxF -- "$1" "$LOG" || fail "not called: $1"; }
 assert_not_called() { ! grep -qE -- "$1" "$LOG" || fail "unexpectedly called: $1"; }
+assert_out_lacks() { ! grep -qF -- "$1" "$OUT" || fail "output unexpectedly has: $1"; }
 assert_file_exists() { [[ -e $1 ]] || fail "missing file: $1"; }
 assert_file_gone() { [[ ! -e $1 ]] || fail "file still exists: $1"; }
 assert_before() {
@@ -277,8 +302,8 @@ test_removes_unselected_installed_items() {
   have_webapp Discord
   have_tui Docker
   have_stub gh
-  have_stub playwright
-  have_stub playwright-cli
+  have_stub playwright npm:playwright
+  have_legacy_playwright_cli 1
   have_pkg lazydocker
   have_pkg obsidian
   run_script OMARCHY_PREINSTALLS_YES=1 OMARCHY_PREINSTALLS_SELECTION='pkg|obsidian'
@@ -313,6 +338,112 @@ test_non_omarchy_desktop_file_is_not_an_installed_webapp() {
   assert_rc 0
   assert_not_called '^omarchy-webapp-remove '
   assert_file_exists "$HOME_DIR/.local/share/applications/X.desktop"
+}
+
+test_cli_user_file_is_never_removed() {
+  have_user_bin claude
+  run_script OMARCHY_PREINSTALLS_YES=1 OMARCHY_PREINSTALLS_SELECTION='pkg|obsidian'
+  assert_rc 0
+  assert_file_exists "$HOME_DIR/.local/bin/claude"
+  assert_out_has "Left untouched (not installed by Omarchy):"
+  assert_out_has "CLI Tool · claude ($HOME_DIR/.local/bin/claude)"
+  assert_out_lacks "  - CLI Tool · claude"
+}
+
+test_cli_user_file_is_never_overwritten() {
+  have_user_bin claude
+  run_script OMARCHY_PREINSTALLS_YES=1 OMARCHY_PREINSTALLS_SELECTION='cli|claude'
+  assert_rc 0
+  assert_not_called '^omarchy-mise-install '
+  grep -qs 'users own claude' "$HOME_DIR/.local/bin/claude" || fail "claude was modified"
+}
+
+test_cli_symlink_is_unmanaged() {
+  mkdir -p "$HOME_DIR/opt"
+  printf '#!/bin/bash\nmise use -g --quiet "claude" || exit 1\n' >"$HOME_DIR/opt/claude"
+  ln -s "$HOME_DIR/opt/claude" "$HOME_DIR/.local/bin/claude"
+  run_script OMARCHY_PREINSTALLS_YES=1 OMARCHY_PREINSTALLS_SELECTION='pkg|obsidian'
+  assert_rc 0
+  [[ -L $HOME_DIR/.local/bin/claude ]] || fail "symlink was removed"
+  assert_out_has "CLI Tool · claude ($HOME_DIR/.local/bin/claude)"
+}
+
+test_cli_stub_for_another_package_is_unmanaged() {
+  have_stub gh some-other-tool
+  run_script OMARCHY_PREINSTALLS_YES=1 OMARCHY_PREINSTALLS_SELECTION='pkg|obsidian'
+  assert_rc 0
+  assert_file_exists "$HOME_DIR/.local/bin/gh"
+  assert_out_has "CLI Tool · gh ($HOME_DIR/.local/bin/gh)"
+}
+
+test_picker_hides_unmanaged_cli_items() {
+  have_user_bin claude
+  run_script MOCK_GUM_CHOOSE_RC=1
+  ! grep -q 'cli|claude$' "$STATE/choose_options" || fail "cli|claude offered in picker"
+  [[ $(grep -c . "$STATE/choose_options") == 38 ]] || fail "expected 38 options"
+}
+
+test_playwright_cli_kept_when_not_a_stub() {
+  have_stub playwright npm:playwright
+  have_user_bin playwright-cli
+  run_script OMARCHY_PREINSTALLS_YES=1 OMARCHY_PREINSTALLS_SELECTION='pkg|obsidian'
+  assert_rc 0
+  assert_file_gone "$HOME_DIR/.local/bin/playwright"
+  assert_file_exists "$HOME_DIR/.local/bin/playwright-cli"
+  assert_out_has "Left $HOME_DIR/.local/bin/playwright-cli in place (not an Omarchy stub)."
+}
+
+test_cli_removal_explains_mise_cleanup() {
+  have_stub ghui npm:@kitlangton/ghui
+  run_script OMARCHY_PREINSTALLS_YES=1 OMARCHY_PREINSTALLS_SELECTION='pkg|obsidian'
+  assert_rc 0
+  assert_file_gone "$HOME_DIR/.local/bin/ghui"
+  assert_out_has "mise still has the tools installed"
+  assert_out_has "  mise unuse -g npm:@kitlangton/ghui"
+}
+
+test_cli_rechecked_before_removal() {
+  have_stub gh
+  printf '%s\n' "printf '#!/bin/bash\necho users own gh\n' >\"\$HOME/.local/bin/gh\"" >"$STATE/on_confirm"
+  run_script OMARCHY_PREINSTALLS_SELECTION='pkg|obsidian'
+  assert_rc 0
+  assert_out_has "  - CLI Tool · gh"
+  grep -qs 'users own gh' "$HOME_DIR/.local/bin/gh" || fail "replaced gh was deleted"
+  assert_out_has "Skipped CLI Tool · gh: $HOME_DIR/.local/bin/gh is no longer an Omarchy stub"
+  assert_out_lacks "mise unuse -g gh"
+}
+
+test_cli_rechecked_before_install() {
+  printf '%s\n' "printf '#!/bin/bash\necho users own claude\n' >\"\$HOME/.local/bin/claude\"" >"$STATE/on_confirm"
+  run_script OMARCHY_PREINSTALLS_SELECTION='cli|claude'
+  assert_rc 0
+  assert_out_has "  + CLI Tool · claude"
+  assert_not_called '^omarchy-mise-install '
+  grep -qs 'users own claude' "$HOME_DIR/.local/bin/claude" || fail "claude was modified"
+  assert_out_has "Skipped CLI Tool · claude: $HOME_DIR/.local/bin/claude appeared since the check"
+}
+
+test_legacy_playwright_cli_formats_are_removed() {
+  local format pkg
+  for format in 1 2 3; do
+    for pkg in playwright playwright-cli; do
+      have_stub playwright npm:playwright
+      have_legacy_playwright_cli "$format" "$pkg"
+      run_script OMARCHY_PREINSTALLS_YES=1 OMARCHY_PREINSTALLS_SELECTION='pkg|obsidian'
+      [[ ! -e $HOME_DIR/.local/bin/playwright-cli ]] ||
+        fail "format $format ($pkg) playwright-cli was not removed"
+    done
+  done
+}
+
+test_playwright_cli_mise_stub_for_other_tool_is_kept() {
+  have_stub playwright npm:playwright
+  have_stub playwright-cli some-unrelated-tool
+  run_script OMARCHY_PREINSTALLS_YES=1 OMARCHY_PREINSTALLS_SELECTION='pkg|obsidian'
+  assert_rc 0
+  assert_file_gone "$HOME_DIR/.local/bin/playwright"
+  assert_file_exists "$HOME_DIR/.local/bin/playwright-cli"
+  assert_out_has "Left $HOME_DIR/.local/bin/playwright-cli in place (not an Omarchy stub)."
 }
 
 # ---------------- run ----------------
