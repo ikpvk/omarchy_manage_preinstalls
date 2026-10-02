@@ -13,12 +13,14 @@ The feature reuses existing Omarchy components. Verify they exist:
 ```bash
 command -v gum                                   # TUI toolkit
 command -v omarchy-webapp-install omarchy-tui-install
-command -v omarchy-mise-install omarchy-pkg-add omarchy-pkg-drop omarchy-pkg-present
+command -v omarchy-webapp-remove omarchy-tui-remove omarchy-cmd-present pacman
+command -v omarchy-mise-install omarchy-install-hermes-cli omarchy-pkg-add omarchy-pkg-drop
 command -v omarchy-launch-floating-terminal-with-presentation
 ```
 
-If any are missing, this feature won't work — but on a stock install all are
-present.
+The script checks these itself at startup and names any that are missing. On a
+current stock install all are present (`omarchy-install-hermes-cli` only ships
+with recent Omarchy releases).
 
 ## Step 1 — Install the script
 
@@ -93,17 +95,28 @@ pre-checked; toggle with `space`/`x`, confirm with `enter`, toggle all with
 # Print the plan without executing (same as the menu, safe to script):
 OMARCHY_DRY_RUN=1 omarchy-preinstalls
 
-# Fully scripted: pick a set and apply without prompts.
+# Fully scripted: the selection is the COMPLETE desired state. Every installed
+# preinstall it doesn't list is removed, which needs an explicit opt-in.
 # Item ids: webapp|<Name> | tui|<Name> | cli|<bin> | pkg|<pkg>
+# This keeps only Discord and Obsidian and removes all other preinstalls:
 OMARCHY_PREINSTALLS_SELECTION=$'webapp|Discord\npkg|obsidian' \
+OMARCHY_PREINSTALLS_ALLOW_REMOVE=1 \
 OMARCHY_PREINSTALLS_YES=1 omarchy-preinstalls
 ```
+
+Preview a selection first with `OMARCHY_DRY_RUN=1` instead of
+`OMARCHY_PREINSTALLS_YES=1`. Unknown ids (e.g. `pkg|Obsidian`) are an error,
+and without `OMARCHY_PREINSTALLS_ALLOW_REMOVE=1` a selection that would remove
+anything stops before changing anything. `OMARCHY_PREINSTALLS_YES=1` without a
+selection is an error.
 
 ## Troubleshooting
 
 | Symptom | Cause / Fix |
 |---|---|
-| `Error: 'gum' is required...` | `gum` missing — install it (`omarchy pkg add gum`). |
+| `Error: required command(s) not found: ...` | An Omarchy helper or `gum` is missing — install `gum` with `omarchy pkg add gum`; for Omarchy helpers, run `omarchy update`. |
+| `Warning: this script's list of preinstalls differs from Omarchy` | Omarchy changed its preinstalls; see "Keeping it up to date" below. Items the script doesn't list are neither shown nor changed. |
+| A run ends with "Failed:" and exits non-zero | Every other change was still applied. Fix the cause, then run `omarchy-preinstalls` again or use the printed retry commands — don't re-run a selection of just the failed ids, since that would remove everything else. |
 | Menu row not visible | Extension not reloaded — reopen the menu, or run `omarchy menu` again. JSONC syntax error → fix and re-save. |
 | "Done" prompt appears once | Correct. The menu wrapper already prints it; do **not** re-add `omarchy-show-done` to the script. |
 | `sudo: a password is required` | Package remove/install self-elevates. Run inside a terminal where sudo can prompt (the menu already does this). |
@@ -112,12 +125,15 @@ OMARCHY_PREINSTALLS_YES=1 omarchy-preinstalls
 ## Keeping it up to date
 
 The inventory tables in the script are hardcoded to the Omarchy version this
-was built against. If a future Omarchy release changes its preinstalled web
-apps, TUIs, mise stubs, or the 13 packages, re-sync the tables in the script
-from:
+was built against. On every run it compares them with `$OMARCHY_PATH` and
+prints a warning naming any differences. When that happens, re-sync the tables
+in the script from:
 
 ```bash
-ls "$OMARCHY_PATH"/applications/*.desktop      # web apps + TUIs
-cat "$OMARCHY_PATH/install/user/mise.sh"       # CLI stubs
-grep -E '^(aether|cliamp|libreoffice-fresh|xournalpp|pinta|obsidian|obs-studio|kdenlive|moonlight-qt|lazydocker|omacut|omacalc|omawrite)$' "$OMARCHY_PATH/install/omarchy-base.packages"
+ls "$OMARCHY_PATH"/applications/*.desktop               # web apps + TUIs
+cat "$OMARCHY_PATH/install/user/mise.sh"                # CLI stubs
+grep -A20 omarchy-pkg-drop "$OMARCHY_PATH/bin/omarchy-remove-preinstalls"   # packages
 ```
+
+New CLI tools may need their own ownership check; copy the one
+`omarchy-remove-preinstalls` uses for them.

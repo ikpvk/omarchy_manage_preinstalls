@@ -14,23 +14,91 @@ set -euo pipefail
 
 DESKTOP_DIR="$HOME/.local/share/applications"
 BIN_DIR="$HOME/.local/bin"
-DRY_RUN="${OMARCHY_DRY_RUN:-0}"
-# Non-interactive override: newline-separated item ids to consider selected.
-# When set, the picker is skipped and the given ids are used directly.
-TEST_SELECTION="${OMARCHY_PREINSTALLS_SELECTION:-}"
 
-if (( $# == 1 )) && [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
-  echo "Usage: omarchy-preinstalls"
-  echo "Manage preinstalled Omarchy applications (web apps, TUIs, CLI tools,"
-  echo "and desktop packages) with an interactive checkbox list."
-  echo
-  echo "Env:  OMARCHY_DRY_RUN=1  print planned actions without executing them"
-  exit 0
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-preinstalls [-h | --help]
+
+Manage preinstalled Omarchy applications (web apps, TUIs, CLI tools, and
+desktop packages) with an interactive checkbox list. Checked items are
+installed if missing; unchecked items are removed if Omarchy installed them.
+Anything at an item's path that Omarchy didn't write is left untouched.
+
+Environment (yes/no values accept 1/0, true/false, or yes/no):
+  OMARCHY_DRY_RUN=1                   print planned actions without executing them
+  OMARCHY_PREINSTALLS_SELECTION=IDS   skip the picker; IDS is the complete desired
+                                      state, one item id per line. Installed items
+                                      not listed are removed (empty = remove all).
+  OMARCHY_PREINSTALLS_ALLOW_REMOVE=1  allow a SELECTION run to remove items
+                                      (required whenever it would remove any)
+  OMARCHY_PREINSTALLS_YES=1           skip the confirmation (requires SELECTION)
+
+Item ids: webapp|<Name>  tui|<Name>  cli|<bin>  pkg|<package>
+  e.g. webapp|Discord  tui|Docker  cli|gh  pkg|obsidian
+EOF
+}
+
+if (( $# > 0 )); then
+  if (( $# == 1 )) && [[ $1 == -h || $1 == --help ]]; then
+    usage
+    exit 0
+  fi
+  echo "omarchy-preinstalls: unexpected argument: $1" >&2
+  usage >&2
+  exit 2
 fi
 
-if ! command -v gum &>/dev/null; then
-  echo "Error: 'gum' is required for the interactive picker and is not installed." >&2
-  exit 1
+# bool_env <env-var> <result-var>: sets <result-var> to 0 or 1. Anything
+# unrecognised is an error rather than a default, so a mistyped dry run never
+# turns into a real one.
+bool_env() {
+  local value="${!1:-}"
+  case ${value,,} in
+  '' | 0 | false | no) printf -v "$2" 0 ;;
+  1 | true | yes) printf -v "$2" 1 ;;
+  *) die "$1 must be 1 or 0 (or true/false, yes/no), not '$value'." ;;
+  esac
+}
+
+bool_env OMARCHY_DRY_RUN DRY_RUN
+bool_env OMARCHY_PREINSTALLS_YES ASSUME_YES
+bool_env OMARCHY_PREINSTALLS_ALLOW_REMOVE ALLOW_REMOVE
+
+# Non-interactive override: newline-separated item ids, the complete desired
+# state. Set but empty means "nothing selected".
+SCRIPTED=0
+if [[ -n ${OMARCHY_PREINSTALLS_SELECTION+x} ]]; then
+  SCRIPTED=1
+fi
+
+# $HOME would be root's, so every launcher and stub check would look in the
+# wrong place. The package helpers ask for sudo themselves.
+if (( EUID == 0 )); then
+  die "run omarchy-preinstalls as your normal user, not as root or with sudo (it asks for sudo itself when packages change)."
+fi
+
+if (( ASSUME_YES && ! SCRIPTED )); then
+  die "OMARCHY_PREINSTALLS_YES=1 requires OMARCHY_PREINSTALLS_SELECTION; picker choices are always confirmed."
+fi
+
+REQUIRED_COMMANDS=(
+  gum pacman omarchy-cmd-present
+  omarchy-pkg-add omarchy-pkg-drop
+  omarchy-webapp-install omarchy-webapp-remove
+  omarchy-tui-install omarchy-tui-remove
+  omarchy-mise-install omarchy-install-hermes-cli
+)
+missing=()
+for cmd in "${REQUIRED_COMMANDS[@]}"; do
+  if ! command -v "$cmd" &>/dev/null; then missing+=("$cmd"); fi
+done
+if (( ${#missing[@]} > 0 )); then
+  die "required command(s) not found: ${missing[*]}"
 fi
 
 # ---------------- inventory ----------------
@@ -62,6 +130,8 @@ EOF
 
 cli_items() {
   # bin <TAB> mise-package [<TAB> command]
+  # hermes is installed by omarchy-install-hermes-cli, not omarchy-mise-install;
+  # its package is only used to explain how to remove the tool completely.
   cat <<'EOF'
 codex	codex
 claude	claude
@@ -74,8 +144,11 @@ playwright	npm:playwright	playwright
 pi	pi
 omp	github:can1357/oh-my-pi	omp
 grok	npm:@xai-official/grok	grok
+cursor-agent	cursor-agent
 ghui	npm:@kitlangton/ghui	ghui
 hunk	aqua:modem-dev/hunk	hunk
+hermes	pipx:hermes-agent[extras=all]
+muse	http:muse[url=https://api.meta.ai/muse-launcher.sh,bin=muse,version_list_url=https://api.meta.ai/muse-code/channels/muse-stable,version_json_path=.version]	muse
 EOF
 }
 
@@ -97,28 +170,52 @@ omawrite
 EOF
 }
 
+# Item -> item it needs: omarchy-launch-docker-tui runs lazydocker.
+declare -A NEEDS=(["tui|Docker"]="pkg|lazydocker")
+
 # ---------------- state detection ----------------
 
-webapp_installed() {
-  local file="$DESKTOP_DIR/$1.desktop"
-  [[ -f $file ]] && grep -qE '^Exec=.*(omarchy-launch-webapp|omarchy-webapp-handler)' "$file"
-}
+WEBAPP_EXEC='^Exec=.*(omarchy-launch-webapp|omarchy-webapp-handler)'
+TUI_EXEC='^Exec=.*xdg-terminal-exec --app-id=TUI\.'
 
-tui_installed() {
-  local file="$DESKTOP_DIR/$1.desktop"
-  [[ -f $file ]] && grep -qE '^Exec=.*xdg-terminal-exec --app-id=TUI\.' "$file"
+# Prints absent, installed, or conflict for <name>.desktop. Omarchy copies its
+# launchers as regular files whose Exec= matches <pattern>; anything else at
+# the path (a user's own launcher, a symlink) must be neither removed nor
+# overwritten, since the install helpers write the file unconditionally.
+launcher_state() {
+  local file="$DESKTOP_DIR/$1.desktop" pattern="$2"
+  if [[ ! -e $file && ! -L $file ]]; then
+    echo absent
+  elif [[ -f $file && ! -L $file ]] && grep -qE "$pattern" "$file"; then
+    echo installed
+  else
+    echo conflict
+  fi
 }
 
 # An Omarchy CLI stub is the wrapper omarchy-mise-install writes: a regular
-# file (not a symlink) with a `mise use -g ... "<package>"` line. Anything else
-# at the path is the user's own and must be neither removed nor overwritten.
+# file (not a symlink) with a `mise use -g ...` line containing <want> (the
+# quoted package). Anything else at the path is the user's own and must be
+# neither removed nor overwritten.
 is_mise_stub() {
-  local file="$1" pkg="$2"
+  local file="$1" want="$2"
   [[ -f $file && ! -L $file ]] || return 1
-  awk -v want="\"$pkg\"" '
+  awk -v want="$want" '
     index($0, "mise use -g ") == 1 && index($0, want) { found = 1 }
     END { exit !found }
   ' "$file"
+}
+
+# Same ownership checks as omarchy-remove-preinstalls: muse's package spec
+# embeds launcher URLs, so only its fixed prefix identifies it, and only
+# omarchy-install-hermes-cli knows which hermes wrapper is its own.
+cli_is_omarchy() {
+  local bin="$1" pkg="$2"
+  case $bin in
+  hermes) omarchy-install-hermes-cli --owns ;;
+  muse) is_mise_stub "$BIN_DIR/$bin" '"http:muse[' ;;
+  *) is_mise_stub "$BIN_DIR/$bin" "\"$pkg\"" ;;
+  esac
 }
 
 # playwright-cli was written by the old omarchy-npx-install, never by mise. Its
@@ -132,112 +229,252 @@ is_legacy_playwright_cli() {
   grep -qE '^(exec (mise exec node@latest -- )?npx --yes (playwright|playwright-cli) "\$@"|package="(playwright|playwright-cli)")$' "$file"
 }
 
+# Omarchy installs these only when the command isn't already on PATH (their
+# own installers put them elsewhere); a stub would shadow that install.
+PATH_GUARDED_CLIS=" cursor-agent muse "
+
 # Prints absent, stub, or conflict (something unmanaged is in the way).
 cli_state() {
-  local file="$BIN_DIR/$1" pkg="$2"
-  if [[ ! -e $file && ! -L $file ]]; then
-    echo absent
-  elif is_mise_stub "$file" "$pkg"; then
-    echo stub
-  else
+  local bin="$1" pkg="$2" file="$BIN_DIR/$1"
+  if [[ -e $file || -L $file ]]; then
+    if cli_is_omarchy "$bin" "$pkg"; then echo stub; else echo conflict; fi
+  elif [[ $PATH_GUARDED_CLIS == *" $bin "* ]] && command -v "$bin" &>/dev/null; then
     echo conflict
+  else
+    echo absent
   fi
 }
 
+# Where the conflicting command for <bin> lives.
+cli_conflict_path() {
+  local file="$BIN_DIR/$1"
+  if [[ -e $file || -L $file ]]; then echo "$file"; else command -v "$1"; fi
+}
+
+# The installed package list, read once. Captured directly so a failed query
+# is an error instead of an empty list (every package would look missing).
+PKG_INVENTORY=''
+load_pkg_inventory() {
+  PKG_INVENTORY=$(pacman -Qq) || return 1
+}
+
 pkg_installed() {
-  omarchy-pkg-present "$1"
+  grep -qxF -- "$1" <<<"$PKG_INVENTORY"
+}
+
+# ---------------- inventory drift ----------------
+
+# report_drift <label> <ours> <theirs>: newline-separated lists.
+DRIFT=()
+report_drift() {
+  local label="$1" item extra='' gone=''
+  local -A in_ours=() in_theirs=()
+  while IFS= read -r item; do
+    if [[ -n $item ]]; then in_ours[$item]=1; fi
+  done <<<"$2"
+  while IFS= read -r item; do
+    if [[ -n $item ]]; then in_theirs[$item]=1; fi
+  done <<<"$3"
+  while IFS= read -r item; do
+    if [[ -n $item && -z ${in_ours[$item]:-} ]]; then extra+="${extra:+, }$item"; fi
+  done <<<"$3"
+  while IFS= read -r item; do
+    if [[ -n $item && -z ${in_theirs[$item]:-} ]]; then gone+="${gone:+, }$item"; fi
+  done <<<"$2"
+  if [[ -n $extra ]]; then
+    DRIFT+=("$label shipped by Omarchy but not managed here: $extra")
+  fi
+  if [[ -n $gone ]]; then
+    DRIFT+=("$label managed here but no longer shipped by Omarchy: $gone")
+  fi
+}
+
+# Compares the built-in lists with the installed Omarchy sources and warns
+# when they differ (this script's lists need updating). Never fatal.
+check_inventory_drift() {
+  local root="${OMARCHY_PATH:-}" file theirs pkg missing=()
+  [[ -n $root && -d $root ]] || return 0
+
+  if [[ -d $root/applications ]]; then
+    theirs=''
+    for file in "$root"/applications/*.desktop; do
+      if [[ -f $file ]] && grep -qE "$WEBAPP_EXEC|$TUI_EXEC" "$file"; then
+        file=${file##*/}
+        theirs+="${file%.desktop}"$'\n'
+      fi
+    done
+    report_drift "Web apps/TUIs" "$({ webapp_items; tui_items; } | awk -F '\t' '{ print $1 }')" "$theirs"
+  fi
+
+  if [[ -f $root/install/user/mise.sh ]]; then
+    theirs=$(awk '
+      /^[[:space:]]*#/ { next }
+      (i = index($0, "omarchy-mise-install ")) {
+        n = split(substr($0, i + 21), a, /[[:space:]]+/)
+        cmd = (n >= 2 && a[2] != "") ? a[2] : a[1]
+        gsub(/"/, "", cmd)
+        print cmd
+      }
+      /(^|[[:space:]])omarchy-install-hermes-cli([[:space:]]|$)/ { print "hermes" }
+    ' "$root/install/user/mise.sh")
+    report_drift "CLI tools" "$(cli_items | awk -F '\t' '{ print $1 }')" "$theirs"
+  fi
+
+  if [[ -f $root/bin/omarchy-remove-preinstalls ]]; then
+    theirs=$(awk '
+      /omarchy-pkg-drop/ { on = 1; sub(/.*omarchy-pkg-drop/, "") }
+      on {
+        line = $0
+        more = sub(/\\[[:space:]]*$/, "", line)
+        n = split(line, a, /[[:space:]]+/)
+        for (k = 1; k <= n; k++) if (a[k] != "") print a[k]
+        if (!more) on = 0
+      }
+    ' "$root/bin/omarchy-remove-preinstalls")
+    report_drift "Packages" "$(pkg_items)" "$theirs"
+  fi
+
+  if [[ -f $root/install/omarchy-base.packages ]]; then
+    while IFS= read -r pkg; do
+      if ! grep -qxF -- "$pkg" "$root/install/omarchy-base.packages"; then missing+=("$pkg"); fi
+    done < <(pkg_items)
+    if (( ${#missing[@]} > 0 )); then
+      DRIFT+=("Packages not in omarchy-base.packages: ${missing[*]}")
+    fi
+  fi
+
+  if (( ${#DRIFT[@]} > 0 )); then
+    echo "Warning: this script's list of preinstalls differs from Omarchy at $root:" >&2
+    printf '  %s\n' "${DRIFT[@]}" >&2
+    echo "Items it doesn't list are not shown or changed." >&2
+    echo >&2
+  fi
 }
 
 # ---------------- actions ----------------
 
+# The last command run, for retry instructions when it fails.
+LAST_CMD=''
 run() {
+  LAST_CMD=$(printf '%q ' "$@")
+  LAST_CMD=${LAST_CMD% }
   if (( DRY_RUN )); then
-    printf '  [dry-run] %s\n' "$(printf '%q ' "$@")"
+    printf '  [dry-run] %s\n' "$LAST_CMD"
     return 0
   fi
   "$@"
 }
 
+# install_id and remove_id handle every item except packages (see pkg_batch).
+# They return 0 when done, 1 when the action failed, and 2 when it was skipped
+# because the path no longer matches what was checked before the prompt.
 install_id() {
-  local id="$1" name url icon exec mime pkg bin cmd style
+  local id="$1" name url icon exec mime pkg bin cmd style args
   case "$id" in
   webapp\|*)
-    name=${id#webapp|}
-    IFS=$'\t' read -r name url icon exec mime <<<"$(webapp_items | awk -F '\t' -v n="$name" '$1==n')"
-    mapfile -t args < <(printf '%s\n' "$name" "$url" "$icon")
-    if [[ -n ${exec:-} ]]; then args+=("$exec"); fi
-    if [[ -n ${mime:-} ]]; then args+=("$mime"); fi
-    run omarchy-webapp-install "${args[@]}"
+    IFS=$'\t' read -r name url icon exec mime <<<"$(webapp_items | awk -F '\t' -v n="${id#webapp|}" '$1==n')"
+    # Re-check right before acting: the install helpers overwrite the file.
+    if [[ $(launcher_state "$name" "$WEBAPP_EXEC") != absent ]]; then
+      echo "  Skipped Web App · $name: $DESKTOP_DIR/$name.desktop appeared since the check; left untouched."
+      return 2
+    fi
+    args=("$name" "$url" "$icon")
+    if [[ -n $exec ]]; then args+=("$exec"); fi
+    if [[ -n $mime ]]; then args+=("$mime"); fi
+    run omarchy-webapp-install "${args[@]}" || return 1
     ;;
   tui\|*)
-    name=${id#tui|}
-    IFS=$'\t' read -r name cmd style icon <<<"$(tui_items | awk -F '\t' -v n="$name" '$1==n')"
-    run omarchy-tui-install "$name" "$cmd" "$style" "$icon"
+    IFS=$'\t' read -r name cmd style icon <<<"$(tui_items | awk -F '\t' -v n="${id#tui|}" '$1==n')"
+    if [[ $(launcher_state "$name" "$TUI_EXEC") != absent ]]; then
+      echo "  Skipped TUI · $name: $DESKTOP_DIR/$name.desktop appeared since the check; left untouched."
+      return 2
+    fi
+    run omarchy-tui-install "$name" "$cmd" "$style" "$icon" || return 1
     ;;
   cli\|*)
-    bin=${id#cli|}
-    IFS=$'\t' read -r bin pkg cmd <<<"$(cli_items | awk -F '\t' -v n="$bin" '$1==n')"
+    IFS=$'\t' read -r bin pkg cmd <<<"$(cli_items | awk -F '\t' -v n="${id#cli|}" '$1==n')"
     # Re-check right before acting: something may have appeared at the path
     # since the picker, and omarchy-mise-install deletes whatever is there.
     if [[ $(cli_state "$bin" "$pkg") != absent ]]; then
-      echo "  Skipped CLI Tool · $bin: $BIN_DIR/$bin appeared since the check; left untouched."
-      return 0
+      echo "  Skipped CLI Tool · $bin: $(cli_conflict_path "$bin") appeared since the check; left untouched."
+      return 2
     fi
-    mapfile -t args < <(printf '%s\n' "$pkg")
-    if [[ -n ${cmd:-} ]]; then args+=("$cmd"); fi
-    run omarchy-mise-install "${args[@]}"
-    ;;
-  pkg\|*)
-    run omarchy-pkg-add "${id#pkg|}"
+    if [[ $bin == hermes ]]; then
+      run omarchy-install-hermes-cli || return 1
+    else
+      args=("$pkg")
+      if [[ -n $cmd ]]; then args+=("$cmd"); fi
+      run omarchy-mise-install "${args[@]}" || return 1
+    fi
     ;;
   esac
+  return 0
+}
+
+# mise commands that finish removing a tool whose stub was removed.
+declare -a LEFTOVERS=()
+note_leftover() {
+  local bin="$1" pkg="$2"
+  # Package specs never contain a single quote.
+  if [[ ! $pkg =~ ^[A-Za-z0-9@:/._+-]+$ ]]; then pkg="'$pkg'"; fi
+  if [[ $bin == hermes ]]; then
+    # What omarchy-install-hermes-cli --remove itself says to run by hand.
+    LEFTOVERS+=("mise rm -g $pkg" "mise uninstall --all $pkg")
+  else
+    LEFTOVERS+=("mise unuse -g $pkg")
+  fi
 }
 
 remove_id() {
-  local id="$1" name pkg
+  local id="$1" name bin pkg
   case "$id" in
   webapp\|*)
     name=${id#webapp|}
-    run omarchy-webapp-remove "$name"
+    if [[ $(launcher_state "$name" "$WEBAPP_EXEC") != installed ]]; then
+      echo "  Skipped Web App · $name: $DESKTOP_DIR/$name.desktop is no longer an Omarchy launcher; left untouched."
+      return 2
+    fi
+    run omarchy-webapp-remove "$name" || return 1
     ;;
   tui\|*)
     name=${id#tui|}
-    run omarchy-tui-remove "$name"
+    # omarchy-tui-remove deletes <name>.desktop without looking at it.
+    if [[ $(launcher_state "$name" "$TUI_EXEC") != installed ]]; then
+      echo "  Skipped TUI · $name: $DESKTOP_DIR/$name.desktop is no longer an Omarchy launcher; left untouched."
+      return 2
+    fi
+    run omarchy-tui-remove "$name" || return 1
     ;;
   cli\|*)
-    name=${id#cli|}
-    IFS=$'\t' read -r name pkg _ <<<"$(cli_items | awk -F '\t' -v n="$name" '$1==n')"
+    IFS=$'\t' read -r bin pkg _ <<<"$(cli_items | awk -F '\t' -v n="${id#cli|}" '$1==n')"
     # Re-check right before acting: the stub may have been replaced since the
     # picker.
-    if [[ $(cli_state "$name" "$pkg") != stub ]]; then
-      echo "  Skipped CLI Tool · $name: $BIN_DIR/$name is no longer an Omarchy stub; left untouched."
-      return 0
+    if [[ $(cli_state "$bin" "$pkg") != stub ]]; then
+      echo "  Skipped CLI Tool · $bin: $BIN_DIR/$bin is no longer an Omarchy stub; left untouched."
+      return 2
     fi
-    run rm -f "$BIN_DIR/$name"
-    MISE_LEFTOVERS+=("$pkg")
+    run rm -f "$BIN_DIR/$bin" || return 1
+    note_leftover "$bin" "$pkg"
     # Legacy companion stub; checked on its own, since the user may own it.
-    if [[ $name == playwright && ( -e $BIN_DIR/playwright-cli || -L $BIN_DIR/playwright-cli ) ]]; then
+    if [[ $bin == playwright && ( -e $BIN_DIR/playwright-cli || -L $BIN_DIR/playwright-cli ) ]]; then
       if is_legacy_playwright_cli "$BIN_DIR/playwright-cli"; then
-        run rm -f "$BIN_DIR/playwright-cli"
+        run rm -f "$BIN_DIR/playwright-cli" || return 1
       else
         echo "  Left $BIN_DIR/playwright-cli in place (not an Omarchy stub)."
       fi
     fi
     ;;
-  pkg\|*)
-    run omarchy-pkg-drop "${id#pkg|}"
-    ;;
   esac
+  return 0
 }
 
 # ---------------- prompt ----------------
 
 declare -a IDS=()
 declare -A ID_LABEL ID_INSTALLED
-# Items whose path holds something Omarchy didn't write: id -> path.
+# Items whose path holds something Omarchy didn't write (CLI stub or .desktop
+# launcher): id -> path.
 declare -A ID_CONFLICT=()
-# mise packages whose CLI stub was removed (the tool itself stays installed).
-declare -a MISE_LEFTOVERS=()
 
 add_item() {
   local id="$1" label="$2" installed="$3"
@@ -247,14 +484,31 @@ add_item() {
 }
 
 name='' url='' icon='' exec='' mime='' pkg='' bin='' cmd='' style=''
+# add_launcher_item <id> <label> <name> <exec-pattern>
+add_launcher_item() {
+  local id="$1" label="$2" name="$3" pattern="$4"
+  case "$(launcher_state "$name" "$pattern")" in
+  installed) add_item "$id" "$label" 1 ;;
+  absent) add_item "$id" "$label" 0 ;;
+  conflict)
+    add_item "$id" "$label" 0
+    ID_CONFLICT["$id"]="$DESKTOP_DIR/$name.desktop"
+    ;;
+  esac
+}
+
+check_inventory_drift
+
+load_pkg_inventory || die "could not list installed packages ('pacman -Qq' failed)."
+
 while IFS=$'\t' read -r name url icon exec mime; do
   [[ -n $name ]] || continue
-  add_item "webapp|$name" "Web App · $name" "$(webapp_installed "$name" && echo 1 || echo 0)"
+  add_launcher_item "webapp|$name" "Web App · $name" "$name" "$WEBAPP_EXEC"
 done < <(webapp_items)
 
 while IFS=$'\t' read -r name cmd style icon; do
   [[ -n $name ]] || continue
-  add_item "tui|$name" "TUI · $name" "$(tui_installed "$name" && echo 1 || echo 0)"
+  add_launcher_item "tui|$name" "TUI · $name" "$name" "$TUI_EXEC"
 done < <(tui_items)
 
 while IFS=$'\t' read -r bin pkg cmd; do
@@ -264,14 +518,18 @@ while IFS=$'\t' read -r bin pkg cmd; do
   absent) add_item "cli|$bin" "CLI Tool · $bin" 0 ;;
   conflict)
     add_item "cli|$bin" "CLI Tool · $bin" 0
-    ID_CONFLICT["cli|$bin"]="$BIN_DIR/$bin"
+    ID_CONFLICT["cli|$bin"]="$(cli_conflict_path "$bin")"
     ;;
   esac
 done < <(cli_items)
 
 while IFS=$'\t' read -r pkg; do
   [[ -n $pkg ]] || continue
-  add_item "pkg|$pkg" "Package · $pkg" "$(pkg_installed "$pkg" && echo 1 || echo 0)"
+  if pkg_installed "$pkg"; then
+    add_item "pkg|$pkg" "Package · $pkg" 1
+  else
+    add_item "pkg|$pkg" "Package · $pkg" 0
+  fi
 done < <(pkg_items)
 
 opts=()
@@ -285,8 +543,8 @@ for id in "${IDS[@]}"; do
 done
 
 set +e
-if [[ -n $TEST_SELECTION ]]; then
-  selection="$TEST_SELECTION"
+if (( SCRIPTED )); then
+  selection="$OMARCHY_PREINSTALLS_SELECTION"
   rc=0
 else
   selection=$(gum choose \
@@ -305,23 +563,69 @@ if (( rc != 0 )); then
   exit 0
 fi
 
+# Every id must be known: under full-desired-state semantics a typo would
+# otherwise silently schedule the intended item for removal.
 declare -A SELECTED=()
+unknown=()
 while IFS= read -r id; do
   [[ -n $id ]] || continue
-  SELECTED["$id"]=1
+  if [[ -z ${ID_LABEL[$id]:-} ]]; then
+    unknown+=("$id")
+  else
+    SELECTED["$id"]=1
+  fi
 done <<<"$selection"
+if (( ${#unknown[@]} > 0 )); then
+  echo "Error: unknown item id(s) in the selection; nothing was changed:" >&2
+  printf '  %s\n' "${unknown[@]}" >&2
+  echo "Ids look like webapp|Discord, tui|Docker, cli|gh, pkg|obsidian (see --help)." >&2
+  exit 1
+fi
 
 # ---------------- diff ----------------
+
+# id -> install | remove | '' (no change).
+declare -A ACTION=()
+for id in "${IDS[@]}"; do
+  if [[ -n ${ID_CONFLICT[$id]:-} ]]; then continue; fi
+  if [[ ${SELECTED[$id]:-0} == 1 ]]; then
+    if [[ ${ID_INSTALLED[$id]} == 0 ]]; then ACTION[$id]=install; fi
+  else
+    if [[ ${ID_INSTALLED[$id]} == 1 ]]; then ACTION[$id]=remove; fi
+  fi
+done
+
+# Whether <id> will be installed once the changes are applied.
+will_have() {
+  case ${ACTION[$1]:-} in
+  install) return 0 ;;
+  remove) return 1 ;;
+  esac
+  [[ ${ID_INSTALLED[$1]} == 1 ]]
+}
+
+# Don't let the changes break a launcher that stays: keep or add what it
+# needs. A combination that was already broken before is left as it is.
+adjustments=()
+for id in "${!NEEDS[@]}"; do
+  need=${NEEDS[$id]}
+  if [[ -n ${ID_CONFLICT[$id]:-} ]] || ! will_have "$id" || will_have "$need"; then continue; fi
+  if [[ ${ACTION[$need]:-} == remove ]]; then
+    ACTION[$need]=''
+    adjustments+=("Keeping ${ID_LABEL[$need]}: ${ID_LABEL[$id]} needs it.")
+  elif [[ ${ACTION[$id]:-} == install ]]; then
+    ACTION[$need]=install
+    adjustments+=("Also installing ${ID_LABEL[$need]}: ${ID_LABEL[$id]} needs it.")
+  fi
+done
 
 install_list=()
 remove_list=()
 for id in "${IDS[@]}"; do
-  if [[ -n ${ID_CONFLICT[$id]:-} ]]; then continue; fi
-  if [[ ${SELECTED[$id]:-0} == 1 ]]; then
-    [[ ${ID_INSTALLED[$id]} == 0 ]] && install_list+=("$id")
-  else
-    [[ ${ID_INSTALLED[$id]} == 1 ]] && remove_list+=("$id")
-  fi
+  case ${ACTION[$id]:-} in
+  install) install_list+=("$id") ;;
+  remove) remove_list+=("$id") ;;
+  esac
 done
 
 echo
@@ -332,6 +636,10 @@ fi
 if (( ${#remove_list[@]} > 0 )); then
   echo "Will remove:"
   for id in "${remove_list[@]}"; do printf '  - %s\n' "${ID_LABEL[$id]}"; done
+fi
+if (( ${#adjustments[@]} > 0 )); then
+  echo "Adjusted for dependencies:"
+  printf '  * %s\n' "${adjustments[@]}"
 fi
 if (( ${#ID_CONFLICT[@]} > 0 )); then
   echo "Left untouched (not installed by Omarchy):"
@@ -346,22 +654,197 @@ if (( ${#install_list[@]} == 0 && ${#remove_list[@]} == 0 )); then
   exit 0
 fi
 
-apply() {
-  for id in "${remove_list[@]}"; do
-    remove_id "$id"
-  done
-  for id in "${install_list[@]}"; do
-    install_id "$id"
-  done
-  if (( ${#MISE_LEFTOVERS[@]} > 0 )); then
+if (( SCRIPTED && ${#remove_list[@]} > 0 && ! ALLOW_REMOVE )); then
+  if (( DRY_RUN )); then
     echo
-    echo "Removed the CLI wrappers only; mise still has the tools installed."
-    echo "To remove one completely, run:"
-    printf '  mise unuse -g %q\n' "${MISE_LEFTOVERS[@]}"
+    echo "Note: a real run needs OMARCHY_PREINSTALLS_ALLOW_REMOVE=1 to remove these items."
+  else
+    echo >&2
+    echo "Error: the selection would remove ${#remove_list[@]} item(s); nothing was changed." >&2
+    echo "OMARCHY_PREINSTALLS_SELECTION lists everything to keep: installed items it" >&2
+    echo "doesn't list are removed. Set OMARCHY_PREINSTALLS_ALLOW_REMOVE=1 to allow that." >&2
+    exit 1
+  fi
+fi
+
+# ---------------- apply ----------------
+
+# id -> ok | skipped | failed | blocked (not attempted because of a failure).
+declare -A OUTCOME=()
+# id -> why it was skipped or blocked by another item.
+declare -A REASON=()
+# Commands that retry the failed steps, in the order they ran.
+declare -a RETRY_CMDS=()
+
+# record <id> <status from install_id/remove_id>
+record() {
+  case $2 in
+  0) OUTCOME[$1]=ok ;;
+  2) OUTCOME[$1]=skipped ;;
+  *)
+    OUTCOME[$1]=failed
+    # The launcher helpers take a same-named file in the current directory as
+    # the icon, so their retries must run from / as well.
+    case $LAST_CMD in
+    omarchy-webapp-install\ * | omarchy-tui-install\ *) RETRY_CMDS+=("(cd / && $LAST_CMD)") ;;
+    *) RETRY_CMDS+=("$LAST_CMD") ;;
+    esac
+    ;;
+  esac
+}
+
+# hold <id> <cause-outcome> <reason>: <id> is not attempted because of another
+# item. Caused by a skip it is a skip too; caused by a failure it is blocked.
+hold() {
+  if [[ $2 == skipped ]]; then OUTCOME[$1]=skipped; else OUTCOME[$1]=blocked; fi
+  REASON[$1]=$3
+}
+
+# Before removing <id>, checks whether a launcher that runs it is still there:
+# its removal failed, was skipped (the path changed hands), or the file simply
+# remains. Prints the outcome to blame and the dependent; returns 1 if none.
+# Every NEEDS key is a launcher, so its path is <name>.desktop.
+still_needed() {
+  local id="$1" dep file
+  for dep in "${!NEEDS[@]}"; do
+    [[ ${NEEDS[$dep]} == "$id" && -z ${ID_CONFLICT[$dep]:-} ]] || continue
+    case ${OUTCOME[$dep]:-} in
+    failed | blocked | skipped)
+      echo "${OUTCOME[$dep]} $dep"
+      return 0
+      ;;
+    esac
+    file="$DESKTOP_DIR/${dep#*|}.desktop"
+    if (( ! DRY_RUN )) && [[ -e $file || -L $file ]]; then
+      echo "failed $dep"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# pkg_batch <add|drop> <id...>: one pacman transaction for all packages, then
+# each package is judged by what is actually installed afterwards. A retry
+# keeps the failed packages together, since they may only work as a batch.
+pkg_batch() {
+  local verb="$1" id names=() failed=() checked=1 present
+  shift
+  (( $# > 0 )) || return 0
+  for id in "$@"; do names+=("${id#pkg|}"); done
+  run "omarchy-pkg-$verb" "${names[@]}" || true
+  if (( DRY_RUN )); then
+    for id in "$@"; do OUTCOME[$id]=ok; done
+    return 0
+  fi
+  if ! load_pkg_inventory; then
+    echo "  Could not check the result ('pacman -Qq' failed)."
+    checked=0
+  fi
+  for id in "$@"; do
+    present=0
+    if pkg_installed "${id#pkg|}"; then present=1; fi
+    if (( checked )) && [[ $verb == add && $present == 1 || $verb == drop && $present == 0 ]]; then
+      OUTCOME[$id]=ok
+    else
+      OUTCOME[$id]=failed
+      failed+=("${id#pkg|}")
+    fi
+  done
+  if (( ${#failed[@]} > 0 )); then
+    RETRY_CMDS+=("$(printf '%q ' "omarchy-pkg-$verb" "${failed[@]}")")
+    RETRY_CMDS[-1]=${RETRY_CMDS[-1]% }
   fi
 }
 
-if [[ $DRY_RUN == 1 ]]; then
+apply() {
+  local id rc pkgs=() batch=() cause
+  # The install helpers treat an icon name as a file path when a file of that
+  # name exists in the current directory.
+  cd /
+
+  # Removals first, so installs have the freed space; launchers before the
+  # packages they run.
+  for id in "${remove_list[@]}"; do
+    if [[ $id == pkg\|* ]]; then pkgs+=("$id"); continue; fi
+    remove_id "$id" && rc=0 || rc=$?
+    record "$id" "$rc"
+  done
+  for id in "${pkgs[@]}"; do
+    if cause=$(still_needed "$id"); then
+      hold "$id" "${cause%% *}" "${ID_LABEL[${cause#* }]} still needs it"
+      echo "  Kept ${ID_LABEL[$id]}: ${ID_LABEL[${cause#* }]} is still installed and needs it."
+    else
+      batch+=("$id")
+    fi
+  done
+  pkg_batch drop "${batch[@]}"
+
+  # Installs: packages first, so launchers find what they run.
+  pkgs=()
+  for id in "${install_list[@]}"; do
+    if [[ $id == pkg\|* ]]; then pkgs+=("$id"); fi
+  done
+  pkg_batch add "${pkgs[@]}"
+  for id in "${install_list[@]}"; do
+    if [[ $id == pkg\|* ]]; then continue; fi
+    cause=${NEEDS[$id]:-}
+    if [[ -n $cause && ${OUTCOME[$cause]:-} == @(failed|blocked) ]]; then
+      hold "$id" failed "needs ${ID_LABEL[$cause]}, which failed"
+      continue
+    fi
+    install_id "$id" && rc=0 || rc=$?
+    record "$id" "$rc"
+  done
+
+  if (( ${#LEFTOVERS[@]} > 0 )); then
+    echo
+    echo "Removed the CLI wrappers only; mise still has the tools installed."
+    echo "To remove one completely, run:"
+    printf '  %s\n' "${LEFTOVERS[@]}"
+  fi
+}
+
+# print_outcomes <heading> <mark> <outcome>
+print_outcomes() {
+  local id action printed=0
+  for id in "${remove_list[@]}" "${install_list[@]}"; do
+    [[ ${OUTCOME[$id]:-} == "$3" ]] || continue
+    if (( ! printed )); then echo "$1"; printed=1; fi
+    action=${ACTION[$id]}
+    printf '  %s %s (%s%s)\n' "$2" "${ID_LABEL[$id]}" "$action" "${REASON[$id]:+; ${REASON[$id]}}"
+  done
+}
+
+# Prints what happened to every change; returns 1 if anything failed.
+report() {
+  local id total=0 ok=0 bad=0
+  for id in "${remove_list[@]}" "${install_list[@]}"; do
+    total=$((total + 1))
+    case ${OUTCOME[$id]:-} in
+    ok) ok=$((ok + 1)) ;;
+    failed | blocked) bad=$((bad + 1)) ;;
+    esac
+  done
+
+  echo
+  echo "Applied $ok of $total changes."
+  print_outcomes "Succeeded:" + ok
+  print_outcomes "Skipped (left untouched):" = skipped
+  print_outcomes "Failed:" '!' failed
+  print_outcomes "Not attempted, because something they depend on failed:" '!' blocked
+  (( bad > 0 )) || return 0
+
+  echo
+  echo "Fix the errors above, then run omarchy-preinstalls again (it starts from"
+  echo "what is installed now)."
+  if (( ${#RETRY_CMDS[@]} > 0 )); then
+    echo "Or retry the failed steps directly:"
+    printf '  %s\n' "${RETRY_CMDS[@]}"
+  fi
+  return 1
+}
+
+if (( DRY_RUN )); then
   echo
   apply
   echo
@@ -369,22 +852,22 @@ if [[ $DRY_RUN == 1 ]]; then
   exit 0
 fi
 
-if [[ ${OMARCHY_PREINSTALLS_YES:-0} != 1 ]]; then
+if (( ! ASSUME_YES )); then
   if ! gum confirm "Apply these changes?"; then
     echo "Cancelled."
     exit 0
   fi
 fi
 
-# ---------------- apply ----------------
-
 echo
 apply
 
+# Always refresh, even after a failure, so whatever did change shows up.
 if omarchy-cmd-present update-desktop-database; then
   update-desktop-database "$DESKTOP_DIR" &>/dev/null || true
 fi
 if omarchy-cmd-present gtk-update-icon-cache; then
   gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" &>/dev/null || true
 fi
-hyprctl reload &>/dev/null || true
+
+report
