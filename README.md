@@ -7,6 +7,7 @@ desktop packages.
 
 - [Install](#install)
 - [Update to the latest version](#update-to-the-latest-version)
+- [Uninstall](#uninstall)
 - [Usage](#usage)
 - [Troubleshooting](#troubleshooting)
 - [What it manages](#what-it-manages)
@@ -26,8 +27,14 @@ There was no way to keep a few items while removing the rest.
 
 ## Install
 
-Everything the tool uses already ships with Omarchy; no new packages are
-needed.
+### Requirements
+
+- **A recent Omarchy release**, one that includes `omarchy-install-hermes-cli`.
+  Check with `command -v omarchy-install-hermes-cli`; if it prints nothing,
+  run `omarchy update` first.
+- Nothing else: `gum`, `pacman`, and the Omarchy helpers the tool uses all
+  ship with Omarchy, so no new packages are needed. At startup the script
+  checks every command it needs and names any that are missing.
 
 ### 1. Get the script
 
@@ -85,9 +92,6 @@ omarchy-preinstalls --help
 OMARCHY_DRY_RUN=1 omarchy-preinstalls   # shows what it would do, changes nothing
 ```
 
-At startup the script checks every Omarchy command it needs and names any
-that are missing.
-
 ## Update to the latest version
 
 The copy in `~/.local/bin` does **not** update itself when the repository
@@ -119,9 +123,7 @@ If you installed before October 2026, note:
 
 - **New items:** the CLI tools `cursor-agent`, `muse`, and `hermes` are now
   managed too (42 items in all).
-- **Newer Omarchy needed:** the script now requires
-  `omarchy-install-hermes-cli`. If it reports that command as missing, run
-  `omarchy update` first.
+- **Newer Omarchy needed:** see [Requirements](#requirements).
 - **Scripts that use `OMARCHY_PREINSTALLS_SELECTION` behave more safely, so
   some need updating:**
   - a selection that would remove anything now also needs
@@ -132,11 +134,30 @@ If you installed before October 2026, note:
     everything) instead of opening the picker;
   - `OMARCHY_PREINSTALLS_YES=1` without a selection is an error.
 - **Stricter input:** yes/no variables accept only `1`/`0`, `true`/`false`,
-  or `yes`/`no`; any argument other than `--help` is an error; running as
+  or `yes`/`no`; any argument other than `-h`/`--help` is an error; running as
   root is refused.
 - **Safer runs:** launchers and CLI files Omarchy didn't write are never
   removed or overwritten, a failed step no longer stops the run, and every
   run ends with a summary of what succeeded, was skipped, or failed.
+
+## Uninstall
+
+Removing the manager doesn't touch the applications it manages: everything
+stays exactly as it is when you uninstall it, and the stock bulk commands
+keep working.
+
+1. Delete the script:
+
+   ```bash
+   rm ~/.local/bin/omarchy-preinstalls
+   ```
+
+2. Remove the menu row: delete the `"install.manage-preinstalls": {…},` line
+   from `~/.config/omarchy/extensions/omarchy-menu.jsonc`. If it was the only
+   entry there, you can delete the whole file instead. The menu reloads on
+   save.
+
+3. Optionally, delete your clone of this repository.
 
 ## Usage
 
@@ -150,6 +171,11 @@ confirms, `ctrl+a` toggles all. The script then shows what it will install
 and remove and asks for confirmation before changing anything. Checked items
 that are missing get installed; unchecked items that are installed get
 removed.
+
+**CLI tools install on first use.** Checking a CLI tool only creates a small
+wrapper in `~/.local/bin`, so that step finishes almost instantly. The tool
+itself is downloaded the first time you run it, so expect that first launch
+to take longer (for `hermes`, a few minutes). Later launches are quick.
 
 The script takes no arguments other than `-h`/`--help`. It refuses to run as
 root: it would act on root's home, and the package helpers ask for `sudo`
@@ -189,12 +215,12 @@ OMARCHY_PREINSTALLS_YES=1 omarchy-preinstalls
 |---|---|
 | `Error: required command(s) not found: ...` | `gum` or an Omarchy helper is missing. Install `gum` with `omarchy pkg add gum`; for Omarchy helpers, run `omarchy update`. |
 | `Warning: this script's list of preinstalls differs from Omarchy` | Omarchy changed its preinstalls. First [update the script](#update-to-the-latest-version); if the warning stays, see [Keeping the lists in sync](#keeping-the-lists-in-sync-with-omarchy). Items the script doesn't list are neither shown nor changed. |
-| A run ends with "Failed:" and exits non-zero | Every other change was still applied. Fix the cause, then run `omarchy-preinstalls` again or use the printed retry commands. Don't re-run a selection of just the failed ids: that would remove everything else. |
+| A run ends with "Failed:" and exits non-zero | Independent changes continue after a failure; changes that depend on a failed one are not attempted. The summary shows what succeeded, failed, or was skipped. Fix the cause, then run `omarchy-preinstalls` again or use the printed retry commands. Don't re-run a selection of just the failed ids: that would remove everything else. |
 | An item is listed under "Left untouched" | Something at that path wasn't written by Omarchy (your own launcher, a native install, a symlink). The script never removes or overwrites it. |
 | Menu row not visible | Reopen the menu, or run `omarchy menu` again. If it still doesn't appear, check the JSONC for a syntax error and save again. |
 | "Done" prompt appears once | Correct: the menu wrapper already shows it. Don't add `omarchy-show-done` to the script. |
 | `sudo: a password is required` | Package changes ask for `sudo`. Run in a terminal where sudo can prompt (the menu already does this). |
-| `preinstalls-removed` marker | The stock bulk entries use `~/.local/state/omarchy/preinstalls-removed`; this tool ignores it, so the two never interfere. A stock bulk remove can still remove items this tool installed, and vice versa. |
+| Using it alongside the stock **Remove/Install → Preinstalls** | This tool never creates or deletes the `~/.local/state/omarchy/preinstalls-removed` marker. The stock bulk commands do, and that marker turns the preinstall keybindings off (present) or on (absent). The stock commands also act on the same items as this tool: a bulk remove removes items you kept here, and a bulk install restores items you removed here. Reinstalling items here after a bulk remove leaves the marker in place, so their keybindings stay off until the stock **Install → Preinstalls** runs. |
 
 ## What it manages
 
@@ -256,8 +282,9 @@ preserves.
 | hermes | installed by `omarchy-install-hermes-cli` | — |
 | muse | `http:muse[url=https://api.meta.ai/muse-launcher.sh,…]` | muse |
 
-Removing a CLI tool removes only its wrapper in `~/.local/bin`; mise keeps
-the tool itself. The script prints the `mise` command that removes it
+Installing a CLI tool writes only its wrapper; the tool itself is downloaded
+the first time you run it. Removing a CLI tool removes only its wrapper in
+`~/.local/bin`; mise keeps the tool itself. The script prints the `mise` command that removes it
 completely.
 
 ### Desktop packages (13)
