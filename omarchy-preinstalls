@@ -1,0 +1,313 @@
+#!/bin/bash
+
+# omarchy:summary=Manage preinstalled Omarchy applications individually (web apps, TUIs, CLI tools, and desktop packages).
+# omarchy:examples=omarchy-preinstalls|OMARCHY_DRY_RUN=1 omarchy-preinstalls
+# omarchy:requires-sudo=true
+
+# Interactive checkbox TUI for the preinstalled Omarchy application set.
+# Shows every item grouped by category, pre-checking the ones installed on the
+# system. On confirm, installs the checked-but-missing items and removes the
+# unchecked-but-installed ones. Pairs with the all-or-nothing
+# omarchy-remove-preinstalls / omarchy-install-preinstalls commands.
+
+set -euo pipefail
+
+DESKTOP_DIR="$HOME/.local/share/applications"
+BIN_DIR="$HOME/.local/bin"
+DRY_RUN="${OMARCHY_DRY_RUN:-0}"
+# Non-interactive override: newline-separated item ids to consider selected.
+# When set, the picker is skipped and the given ids are used directly.
+TEST_SELECTION="${OMARCHY_PREINSTALLS_SELECTION:-}"
+
+if (( $# == 1 )) && [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  echo "Usage: omarchy-preinstalls"
+  echo "Manage preinstalled Omarchy applications (web apps, TUIs, CLI tools,"
+  echo "and desktop packages) with an interactive checkbox list."
+  echo
+  echo "Env:  OMARCHY_DRY_RUN=1  print planned actions without executing them"
+  exit 0
+fi
+
+if ! command -v gum &>/dev/null; then
+  echo "Error: 'gum' is required for the interactive picker and is not installed." >&2
+  exit 1
+fi
+
+# ---------------- inventory ----------------
+
+webapp_items() {
+  # name <TAB> url <TAB> icon [<TAB> custom-exec <TAB> mime-types]
+  cat <<'EOF'
+Basecamp	https://launchpad.37signals.com	basecamp
+Discord	https://discord.com/channels/@me	omarchy-discord
+Google Contacts	https://contacts.google.com/	google-contacts
+Google Maps	https://maps.google.com	google-maps
+Google Messages	https://messages.google.com/web/conversations	google-messages
+Google Photos	https://photos.google.com/	google-photos
+HEY	https://app.hey.com	hey	omarchy-webapp-handler-hey %u	x-scheme-handler/mailto
+WhatsApp	https://web.whatsapp.com/	whatsapp
+X	https://x.com/	x
+YouTube	https://youtube.com/	youtube
+Zoom	https://app.zoom.us	zoom	omarchy-webapp-handler-zoom %u	x-scheme-handler/zoommtg;x-scheme-handler/zoomus
+EOF
+}
+
+tui_items() {
+  # name <TAB> command <TAB> style <TAB> icon
+  cat <<'EOF'
+Disk Usage	bash -c "dua i /"	float	disk-usage
+Docker	omarchy-launch-docker-tui	tile	docker
+EOF
+}
+
+cli_items() {
+  # bin <TAB> mise-package [<TAB> command]
+  cat <<'EOF'
+codex	codex
+claude	claude
+crush	crush
+gemini	gemini
+gh	gh
+copilot	copilot
+opencode	opencode
+playwright	npm:playwright	playwright
+pi	pi
+omp	github:can1357/oh-my-pi	omp
+grok	npm:@xai-official/grok	grok
+ghui	npm:@kitlangton/ghui	ghui
+hunk	aqua:modem-dev/hunk	hunk
+EOF
+}
+
+pkg_items() {
+  cat <<'EOF'
+aether
+cliamp
+libreoffice-fresh
+xournalpp
+pinta
+obsidian
+obs-studio
+kdenlive
+moonlight-qt
+lazydocker
+omacut
+omacalc
+omawrite
+EOF
+}
+
+# ---------------- state detection ----------------
+
+webapp_installed() {
+  local file="$DESKTOP_DIR/$1.desktop"
+  [[ -f $file ]] && grep -qE '^Exec=.*(omarchy-launch-webapp|omarchy-webapp-handler)' "$file"
+}
+
+tui_installed() {
+  local file="$DESKTOP_DIR/$1.desktop"
+  [[ -f $file ]] && grep -qE '^Exec=.*xdg-terminal-exec --app-id=TUI\.' "$file"
+}
+
+cli_installed() {
+  [[ -x "$BIN_DIR/$1" ]]
+}
+
+pkg_installed() {
+  omarchy-pkg-present "$1"
+}
+
+# ---------------- actions ----------------
+
+run() {
+  if (( DRY_RUN )); then
+    printf '  [dry-run] %s\n' "$(printf '%q ' "$@")"
+    return 0
+  fi
+  "$@"
+}
+
+install_id() {
+  local id="$1" name url icon exec mime pkg bin cmd style
+  case "$id" in
+  webapp\|*)
+    name=${id#webapp|}
+    IFS=$'\t' read -r name url icon exec mime <<<"$(webapp_items | awk -F '\t' -v n="$name" '$1==n')"
+    mapfile -t args < <(printf '%s\n' "$name" "$url" "$icon")
+    if [[ -n ${exec:-} ]]; then args+=("$exec"); fi
+    if [[ -n ${mime:-} ]]; then args+=("$mime"); fi
+    run omarchy-webapp-install "${args[@]}"
+    ;;
+  tui\|*)
+    name=${id#tui|}
+    IFS=$'\t' read -r name cmd style icon <<<"$(tui_items | awk -F '\t' -v n="$name" '$1==n')"
+    run omarchy-tui-install "$name" "$cmd" "$style" "$icon"
+    ;;
+  cli\|*)
+    bin=${id#cli|}
+    IFS=$'\t' read -r bin pkg cmd <<<"$(cli_items | awk -F '\t' -v n="$bin" '$1==n')"
+    mapfile -t args < <(printf '%s\n' "$pkg")
+    if [[ -n ${cmd:-} ]]; then args+=("$cmd"); fi
+    run omarchy-mise-install "${args[@]}"
+    ;;
+  pkg\|*)
+    run omarchy-pkg-add "${id#pkg|}"
+    ;;
+  esac
+}
+
+remove_id() {
+  local id="$1" name
+  case "$id" in
+  webapp\|*)
+    name=${id#webapp|}
+    run omarchy-webapp-remove "$name"
+    ;;
+  tui\|*)
+    name=${id#tui|}
+    run omarchy-tui-remove "$name"
+    ;;
+  cli\|*)
+    name=${id#cli|}
+    run rm -f "$BIN_DIR/$name"
+    if [[ $name == playwright ]]; then
+      run rm -f "$BIN_DIR/playwright-cli"
+    fi
+    ;;
+  pkg\|*)
+    run omarchy-pkg-drop "${id#pkg|}"
+    ;;
+  esac
+}
+
+# ---------------- prompt ----------------
+
+declare -a IDS=()
+declare -A ID_LABEL ID_INSTALLED
+
+add_item() {
+  local id="$1" label="$2" installed="$3"
+  IDS+=("$id")
+  ID_LABEL["$id"]="$label"
+  ID_INSTALLED["$id"]="$installed"
+}
+
+name= url= icon= exec= mime= pkg= bin= cmd= style=
+while IFS=$'\t' read -r name url icon exec mime; do
+  [[ -n $name ]] || continue
+  add_item "webapp|$name" "Web App · $name" "$(webapp_installed "$name" && echo 1 || echo 0)"
+done < <(webapp_items)
+
+while IFS=$'\t' read -r name cmd style icon; do
+  [[ -n $name ]] || continue
+  add_item "tui|$name" "TUI · $name" "$(tui_installed "$name" && echo 1 || echo 0)"
+done < <(tui_items)
+
+while IFS=$'\t' read -r bin pkg cmd; do
+  [[ -n $bin ]] || continue
+  add_item "cli|$bin" "CLI Tool · $bin" "$(cli_installed "$bin" && echo 1 || echo 0)"
+done < <(cli_items)
+
+while IFS=$'\t' read -r pkg; do
+  [[ -n $pkg ]] || continue
+  add_item "pkg|$pkg" "Package · $pkg" "$(pkg_installed "$pkg" && echo 1 || echo 0)"
+done < <(pkg_items)
+
+opts=()
+selected_labels=()
+for id in "${IDS[@]}"; do
+  opts+=("${ID_LABEL[$id]}:$id")
+  if [[ ${ID_INSTALLED[$id]} == 1 ]]; then
+    selected_labels+=("${ID_LABEL[$id]}")
+  fi
+done
+
+set +e
+if [[ -n $TEST_SELECTION ]]; then
+  selection="$TEST_SELECTION"
+  rc=0
+else
+  selection=$(gum choose \
+    --no-limit \
+    --label-delimiter=: \
+    --header "Preinstalled applications (space/x: toggle, enter: done, ctrl+a: all)" \
+    --height 20 \
+    --selected "$(IFS=,; printf '%s' "${selected_labels[*]}")" \
+    "${opts[@]}")
+  rc=$?
+fi
+set -e
+
+if (( rc != 0 )); then
+  echo "Cancelled."
+  exit 0
+fi
+
+declare -A SELECTED=()
+while IFS= read -r id; do
+  [[ -n $id ]] || continue
+  SELECTED["$id"]=1
+done <<<"$selection"
+
+# ---------------- diff ----------------
+
+install_list=()
+remove_list=()
+for id in "${IDS[@]}"; do
+  if [[ ${SELECTED[$id]:-0} == 1 ]]; then
+    [[ ${ID_INSTALLED[$id]} == 0 ]] && install_list+=("$id")
+  else
+    [[ ${ID_INSTALLED[$id]} == 1 ]] && remove_list+=("$id")
+  fi
+done
+
+echo
+if (( ${#install_list[@]} > 0 )); then
+  echo "Will install:"
+  for id in "${install_list[@]}"; do printf '  + %s\n' "${ID_LABEL[$id]}"; done
+fi
+if (( ${#remove_list[@]} > 0 )); then
+  echo "Will remove:"
+  for id in "${remove_list[@]}"; do printf '  - %s\n' "${ID_LABEL[$id]}"; done
+fi
+if (( ${#install_list[@]} == 0 && ${#remove_list[@]} == 0 )); then
+  echo "Nothing to do."
+  exit 0
+fi
+
+apply() {
+  for id in "${remove_list[@]}"; do
+    remove_id "$id"
+  done
+  for id in "${install_list[@]}"; do
+    install_id "$id"
+  done
+}
+
+if [[ $DRY_RUN == 1 ]]; then
+  echo
+  apply
+  echo
+  echo "Dry run — no changes made."
+  exit 0
+fi
+
+if [[ ${OMARCHY_PREINSTALLS_YES:-0} != 1 ]]; then
+  if ! gum confirm "Apply these changes?"; then
+    echo "Cancelled."
+    exit 0
+  fi
+fi
+
+# ---------------- apply ----------------
+
+echo
+apply
+
+if omarchy-cmd-present update-desktop-database; then
+  update-desktop-database "$DESKTOP_DIR" &>/dev/null || true
+fi
+if omarchy-cmd-present gtk-update-icon-cache; then
+  gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" &>/dev/null || true
+fi
+hyprctl reload &>/dev/null || true
